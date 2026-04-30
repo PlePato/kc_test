@@ -1,0 +1,92 @@
+    @Override
+    public synchronized void refresh()
+            throws GSSException
+    {
+        // TODO: do we need to call logout() on the LoginContext?
+        int stage = 0;
+        // int[] used to allow mutation from within the anonymous Configuration class
+        int[] innerStage = {0};
+        // String[] used to capture the built options for error logging
+        String[] builtOptions = {""};
+        try {
+            stage = 1;
+            loginContext = new LoginContext("", null, null, new Configuration()
+            {
+                @Override
+                public AppConfigurationEntry[] getAppConfigurationEntry(String name)
+                {
+                    ImmutableMap.Builder<String, String> options = ImmutableMap.builder();
+                    // IBM JDK strictly enforces Krb5LoginModule option compatibility rules:
+                    // - credsType=initiator + useCcache: compatible, non-interactive (ccache-only flow)
+                    // - credsType=initiator + useKeytab: incompatible (enforced strictly in newer IBM JDK versions)
+                    // - credsType=both + useKeytab: compatible, non-interactive (keytab flow)
+                    // - credsType=both without useKeytab: tries to obtain acceptor secret key, prompts for password -> fails headless
+                    innerStage[0] = 1;
+                    options.put("credsType", keytab.isPresent() ? "both" : "initiator");
+                    innerStage[0] = 2;
+                    options.put("forwardable", "false");
+
+                    if (Boolean.getBoolean("trino.client.debugKerberos")) {
+                        options.put("debug", "true");
+                    }
+
+                    innerStage[0] = 3;
+                    keytab.ifPresent(file -> options.put("useKeytab", file.toURI().toString()));
+
+                    innerStage[0] = 4;
+                    credentialCache.ifPresent(file -> options.put("useCcache", file.toURI().toString()));
+
+                    innerStage[0] = 5;
+                    principal.ifPresent(value -> options.put("principal", value));
+
+                    innerStage[0] = 6;
+                    ImmutableMap<String, String> builtMap = options.buildOrThrow();
+                    builtOptions[0] = builtMap.toString();
+                    innerStage[0] = 7;
+                    return new AppConfigurationEntry[] {
+                            new AppConfigurationEntry("com.ibm.security.auth.module.Krb5LoginModule", REQUIRED, builtMap)
+                    };
+                }
+            });
+            stage = 2;
+
+            loginContext.login();
+            stage = 3;
+        }
+        catch (LoginException e) {
+            String keytabPath = keytab.map(File::getAbsolutePath).orElse("not defined");
+            String credentialCachePath = credentialCache.map(File::getAbsolutePath).orElse("not defined");
+            String principalValue = principal.orElse("not defined");
+
+            String keytabDiag = keytab.map(file -> format("present=true, exists=%s, readable=%s", file.exists(), file.canRead())).orElse("present=false");
+            String ccacheDiag = credentialCache.map(file -> format("present=true, exists=%s, readable=%s", file.exists(), file.canRead())).orElse("present=false");
+            String krb5Conf = System.getProperty("java.security.krb5.conf", "not set");
+            String javaVendor = System.getProperty("java.vendor", "unknown");
+            String javaVersion = System.getProperty("java.version", "unknown");
+
+            // stage: 1=LoginContext creation failed, 2=loginContext.login() failed, 3=success (should not reach catch)
+            // innerStage: 1=before credsType put, 2=before forwardable put, 3=before useKeytab, 4=before useCcache, 5=before principal, 6=before AppConfigurationEntry build
+            throw new ClientException(format(
+                    "Kerberos login error at stage [%d] innerStage [%d] for principal [%s], keytab [%s] (%s), credential cache [%s] (%s), " +
+                    "krb5.conf [%s], java.vendor [%s], java.version [%s], login module options [%s]",
+                    stage, innerStage[0], principalValue, keytabPath, keytabDiag, credentialCachePath, ccacheDiag,
+                    krb5Conf, javaVendor, javaVersion, builtOptions[0]), e);
+        }
+    }
+	
+	
+	
+Summary
+Error
+Login Failure: all modules ignored — Cognos could not authenticate to Trino via Kerberos JDBC after upgrading IBM JDK 1.8.0_451 → 1.8.0_461 and AIX minor version.
+
+Root Cause
+The cron job refreshing the Kerberos credential cache was using the system kinit, which issued a TGT encrypted with DES3-CBC-SHA1. IBM JDK 1.8.0_461 disabled DES3, so when Cognos's JVM tried to read the ccache, it rejected the ticket silently — JAAS reported "all modules ignored".
+
+Solution
+Update the cron job to use Cognos's own JDK kinit instead of the system one:
+
+Cognos's JDK kinit defaults to AES256, which IBM JDK 1.8.0_461 accepts. The ccache now contains an AES256 ticket and authentication succeeds.
+
+Key lesson
+Always use the same JDK's kinit to populate the ccache as the JVM that will consume it — they must agree on which encryption types are acceptable.
