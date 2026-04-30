@@ -90,3 +90,5 @@ Cognos's JDK kinit defaults to AES256, which IBM JDK 1.8.0_461 accepts. The ccac
 
 Key lesson
 Always use the same JDK's kinit to populate the ccache as the JVM that will consume it — they must agree on which encryption types are acceptable.
+
+.\mvn\bin\mvn clean install -DskipTests -pl client/trino-client,client/trino-jdbc 2>&1 | Select-String -Pattern "ERROR|BUILD|WARNING"
